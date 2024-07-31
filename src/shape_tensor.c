@@ -1,0 +1,2729 @@
+/*****************************************************************************
+ *
+ *  fe_st.c
+ *
+ *  Routines related to shape tensor free energy
+ *  and molecular field.
+ *
+ *  Edinburgh Soft Matter and Statistical Physics Group and
+ *  Edinburgh Parallel Computing Centre
+ *
+ *  (c) 2011-2022 The University of Edinburgh
+ *
+ *  Contributing authors:
+ *  Kevin Stratford (kevin@epcc.ed.ac.uk)
+ *
+ *****************************************************************************/
+
+#include <assert.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "util.h"
+#include "physics.h"
+#include "shape_tensor.h"
+#include "util_shapetensor.h"
+
+static __constant__ fe_st_param_t const_param;
+
+/* To prevent numerical catastrophe, we impose a minimum redshift.
+ * However, one should probably not be flirting with this value at
+ * all in general usage. */
+
+#define FE_ST_REDSHIFT_MIN 0.00000000001
+
+static fe_vt_t fe_st_hvt = {
+  (fe_free_ft)      fe_st_free,
+  (fe_target_ft)    fe_st_target,
+  (fe_fed_ft)       fe_st_fed,
+  (fe_mu_ft)        NULL,
+  (fe_mu_solv_ft)   NULL,
+  (fe_str_ft)       fe_st_stress,
+  (fe_str_ft)       fe_st_str_symm,
+  (fe_str_ft)       fe_st_str_anti,
+  (fe_hvector_ft)   NULL,
+  (fe_htensor_ft)   fe_st_mol_field,
+  (fe_htensor_v_ft) fe_st_mol_field_v,
+  (fe_stress_v_ft)  fe_st_stress_v,
+  (fe_stress_v_ft)  fe_st_str_symm_v,
+  (fe_stress_v_ft)  fe_st_str_anti_v
+};
+
+static __constant__ fe_vt_t fe_st_dvt = {
+  (fe_free_ft)      NULL,
+  (fe_target_ft)    NULL,
+  (fe_fed_ft)       fe_st_fed,
+  (fe_mu_ft)        NULL,
+  (fe_mu_solv_ft)   NULL,
+  (fe_str_ft)       fe_st_stress,
+  (fe_str_ft)       fe_st_str_symm,
+  (fe_str_ft)       fe_st_str_anti,
+  (fe_hvector_ft)   NULL,
+  (fe_htensor_ft)   fe_st_mol_field,
+  (fe_htensor_v_ft) fe_st_mol_field_v,
+  (fe_stress_v_ft)  fe_st_stress_v,
+  (fe_stress_v_ft)  fe_st_str_symm_v,
+  (fe_stress_v_ft)  fe_st_str_anti_v
+};
+
+
+/*****************************************************************************
+ *
+ *  fe_st_create
+ *
+ *  "le" only used in initialisation of field p, so may be NULL
+ *
+****************************************************************************/
+
+__host__ int fe_st_create(pe_t * pe, cs_t * cs, lees_edw_t * le,
+			  field_t * r, field_grad_t * dr, fe_st_t ** pobj) {
+
+  int ndevice;
+  int nhalo;
+  fe_st_t * fe = NULL;
+
+  assert(pe);
+  assert(cs);
+  assert(r);
+  assert(dr);
+  assert(pobj);
+
+  fe = (fe_st_t *) calloc(1, sizeof(fe_st_t));
+  assert(fe);
+  if (fe == NULL) pe_fatal(pe, "calloc(fe_st_t) failed\n");
+
+  fe->param = (fe_st_param_t *) calloc(1, sizeof(fe_st_param_t));
+  assert(fe->param);
+  if (fe->param == NULL) pe_fatal(pe, "calloc(fe_st_param_t) failed\n");
+
+  fe->pe = pe;
+  fe->cs = cs;
+  fe->r = r;
+  fe->dr = dr;
+
+  /* Additional active stress field "p" */
+
+  cs_nhalo(fe->cs, &nhalo);
+
+  {
+    /* Active P 3-vector */
+    field_options_t opts = field_options_ndata_nhalo(3, nhalo);
+    field_create(pe, cs, le, "Active P", &opts, &fe->p);
+    field_grad_create(pe, fe->p, 2, &fe->dp);
+  }
+
+  /* free energy interface functions */
+  fe->super.func = &fe_st_hvt;
+  fe->super.id = FE_ST;
+
+  /* Allocate device memory, or alias */
+
+  tdpGetDeviceCount(&ndevice);
+
+  if (ndevice == 0) {
+    fe->target = fe;
+  }
+  else {
+    fe_st_param_t * tmp;
+    fe_st_t * vt;
+
+    tdpAssert(tdpMalloc((void **) &fe->target, sizeof(fe_st_t)));
+    tdpAssert(tdpMemset(fe->target, 0, sizeof(fe_st_t)));
+
+    tdpGetSymbolAddress((void **) &tmp, tdpSymbol(const_param));
+
+    tdpAssert(tdpMemcpy(&fe->target->param, &tmp, sizeof(fe_st_param_t *),
+			tdpMemcpyHostToDevice));
+    tdpGetSymbolAddress((void **) &vt, tdpSymbol(fe_st_dvt));
+
+
+    tdpAssert(tdpMemcpy(&fe->target->super.func, &vt, sizeof(fe_vt_t *),
+			tdpMemcpyHostToDevice));
+
+    /* R_ab, gradient */
+    tdpAssert(tdpMemcpy(&fe->target->r, &r->target, sizeof(field_t *),
+			tdpMemcpyHostToDevice));
+    tdpAssert(tdpMemcpy(&fe->target->dr, &dr->target, sizeof(field_grad_t *),
+			tdpMemcpyHostToDevice));
+    /* Active stress */
+    tdpAssert(tdpMemcpy(&fe->target->p, &fe->p->target, sizeof(field_t *),
+			tdpMemcpyHostToDevice));
+    tdpAssert(tdpMemcpy(&fe->target->dp, &fe->dp->target,
+			sizeof(field_grad_t *), tdpMemcpyHostToDevice));
+  }
+
+  *pobj = fe;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_free
+ *
+****************************************************************************/
+
+__host__ int fe_st_free(fe_st_t * fe) {
+
+  int ndevice;
+
+  assert(fe);
+
+  tdpGetDeviceCount(&ndevice);
+
+  if (ndevice > 0) tdpAssert(tdpFree(fe->target));
+
+  if (fe->dp) field_grad_free(fe->dp);
+  if (fe->p) field_free(fe->p);
+
+  free(fe->param);
+  free(fe);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_target
+ *
+ *  Commit the parameters as a kernel call may be imminent.
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_target(fe_st_t * fe, fe_t ** target) {
+
+  assert(fe);
+  assert(target);
+
+  fe_st_param_commit(fe);
+  *target = (fe_t *) fe->target;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_param_commit
+ *
+ *  Includes time-dependent electric field.
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_param_commit(fe_st_t * fe) {
+
+  double e0_freq, t;
+  physics_t * phys = NULL;
+  PI_DOUBLE(pi);
+
+  assert(fe);
+
+  physics_ref(&phys);
+  physics_e0_frequency(phys, &e0_freq);
+  physics_control_time(phys, &t);
+
+  fe->param->coswt = cos(2.0*pi*e0_freq*t);
+
+  tdpMemcpyToSymbol(tdpSymbol(const_param), fe->param, sizeof(fe_st_param_t),
+		    0, tdpMemcpyHostToDevice);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_param_set
+ *
+ *  The caller is responsible for all values.
+ *
+ *  Note that these values can remain unchanged throughout. Redshifted
+ *  values are computed separately as needed.
+ *
+****************************************************************************/
+
+__host__ int fe_st_param_set(fe_st_t * fe, const fe_st_param_t * values) {
+
+  PI_DOUBLE(pi);
+
+  assert(fe);
+
+  *fe->param = *values;
+
+  /* The convention here is to non-dimensionalise the dielectric
+   * anisotropy by factor (1/12pi) which appears in free energy. */
+
+  fe->param->epsilon *= (1.0/(12.0*pi));
+
+  /* Must compute reciprocal of redshift */
+  fe_st_redshift_set(fe, fe->param->redshift);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_param
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_param(fe_st_t * fe, fe_st_param_t * vals) {
+
+  assert(fe);
+  assert(vals);
+
+  *vals = *fe->param;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_fed
+ *
+ *  Return the free energy density at lattice site index.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_fed(fe_st_t * fe, int index, double * fed) {
+
+  double r[3][3];
+  double dr[3][3][3];
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+
+  fe_st_compute_fed(fe, r, dr, fed);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_fed
+ *
+ *  Compute the free energy density as a function of r and the r gradient
+ *  tensor dr.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_compute_fed(fe_st_t * fe, 
+					  double r[3][3],
+					  double dr[3][3][3], double * fed) {
+
+  //int ia;
+  double k;
+  //double lambda0;
+  double *lambda;
+  //double detR;
+  //double I2R;
+  double trR;
+
+  assert(fe);
+  assert(fed);
+
+  k = fe->param->k;
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+
+
+  /* Version I */
+  /* ln(det(R_ab)) */
+  /*
+  int twod;
+  twod = fe->param->twod;
+  double detR, detaR, lndetaR;
+  if(twod==0) {
+    detR = r[0][0]*(r[1][1]*r[2][2] - r[2][1]*r[1][2]);
+    detR -= r[0][1]*(r[1][0]*r[2][2]-r[2][0]*r[1][2]);
+    detR += r[0][2]*(r[1][0]*r[2][1]-r[2][0]*r[1][1]);
+    detaR = detR/(lambda0*lambda0*lambda0);
+  }
+  else {
+    detR = r[0][0]*r[2][2] - r[0][2]*r[2][0]; 
+    detaR = detR/(lambda0*lambda0);
+  }
+
+  lndetaR = log(detaR);
+
+  *fed = 0.5*k*(trR - lambda0*lndetaR);
+  */
+  /* Version II */
+  /* Tr(R_ab) */
+  /*
+  lambda0 = fe->param->lambda0;
+  trR = 0.0;
+  for (ia = 0; ia < 3; ia++) {
+    trR += r[ia][ia];
+  }
+
+  *fed = k*log(trR/lambda0);
+  */
+
+  /* Version III */
+  //lambda = fe->param->lambda; 
+  //I2R = lambda[0]*lambda[1] + lambda[1]*lambda[2] + lambda[2]*lambda[0];
+  //detR= lambda[0]*lambda[1]*lambda[2];
+  //*fed = k*log(I2R/pow(detR,2.0/3.0));
+  /* Version IV */
+  lambda = fe->param->lambda; 
+  trR = r[0][0] + r[1][1];
+  *fed = k*log(trR/lambda[0]);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_stress
+ *
+ *  Return the stress sth[3][3] at lattice site index.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_stress(fe_st_t * fe, int index,
+				     double sth[3][3]) {
+
+  double r[3][3];
+  double h[3][3];
+  double dr[3][3][3];
+  double dsr[3][3];
+
+  assert(fe);
+  assert(fe->r);
+  assert(fe->dr);
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+  field_grad_tensor_delsq(fe->dr, index, dsr);
+
+  fe_st_compute_h(fe, r, dr, dsr, h);
+  fe_st_compute_stress(fe, r, dr, h, sth);
+
+  if (fe->param->is_active) {
+    double dp[3][3];
+    double sa[3][3];
+    field_grad_vector_grad(fe->dp, index, dp);
+    fe_st_compute_stress_active(fe, r, dp, sa);
+    for (int ia = 0; ia < 3; ia++) {
+      for (int ib = 0; ib < 3; ib++) {
+	sth[ia][ib] += sa[ia][ib];
+      }
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_bulk_stress
+ *
+ *  Return the bulk contribution to the stress sth[3][3] at lattice site index.
+ *  First we determine the bulk contributions to the molecular field and FE.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_bulk_stress(fe_st_t * fe, int index,
+				     double sth[3][3]) {
+
+  double r[3][3];
+  //double dk[3][3];
+  double fed;
+  double p0;
+
+  double k;
+  //int twod;
+//  double q0;              /* Redshifted value */
+//  double kappa1;  /* Redshifted value */
+
+  int ia, ib;
+
+  KRONECKER_DELTA_CHAR(d);
+
+  assert(fe);
+  assert(fe->r);
+
+  field_tensor(fe->r, index, r);
+
+  k = fe->param->k;
+  //twod = fe->param->twod;
+  /*Version I*/
+  /*
+  double lambda0;
+  lambda0 = fe->param->lambda0;
+  */
+/*
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      dk[ia][ib] = d[ia][ib];
+    }
+  }*/
+  //if(twod==1) dk[1][1] = 0.0;
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+
+  /* bulk contribution to free energy */
+  fe_st_compute_bulk_fed(fe, r, &fed); 
+
+  /* bulk contribtion to stress */
+
+  p0 = 0.0 - fed;
+
+  /* The term in the isotropic pressure */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      sth[ia][ib] = -p0*d[ia][ib];
+    }
+  }
+  
+  //double trR = r[0][0]+r[1][1]+r[2][2];
+//
+ // for (ia = 0; ia < 3; ia++) {
+  //  for (ib = 0; ib < 3; ib++) {
+   //   /*Version I*/
+    //  /*sth[ia][ib] += k*(r[ia][ib] - lambda0*dk[ia][ib]);*/
+     // /*Version II*/
+      //sth[ia][ib] += (2.0*k/trR)*(r[ia][ib] - 0.5*trR*dk[ia][ib]);
+  //  }
+ // }
+  /*Version IV*/
+  double trR = r[0][0]+r[1][1];
+
+  for (ia = 0; ia < 3-1; ia++) {
+    for (ib = 0; ib < 3-1; ib++) {
+      sth[ia][ib] += (2.0*k/trR)*(r[ia][ib] - 0.5*trR*d[ia][ib]);
+    }
+  }
+
+  /* This is the minus sign. */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+	sth[ia][ib] = -sth[ia][ib];
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_grad_stress
+ *
+ *  Return the gradient contribution to the stress sth[3][3] at lattice site index.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_grad_stress(fe_st_t * fe, int index,
+				     double sth[3][3]) {
+  double r[3][3];
+//  double h[3][3];
+//  double qh;
+  double dr[3][3][3];
+  double dsr[3][3];
+  double fed;
+  double p0;
+
+//  double q0;              /* Redshifted value */
+//  double kappa0, kappa1;  /* Redshifted values */
+//
+//  double eq;
+//  double sum;
+//  const double r3 = (1.0/3.0);
+//
+  int ia, ib, ic;
+//  int  id, ie;
+//
+  KRONECKER_DELTA_CHAR(d);
+//  LEVI_CIVITA_CHAR(e);
+
+  assert(fe);
+  assert(fe->r);
+  assert(fe->dr);
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+  field_grad_tensor_delsq(fe->dr, index, dsr);
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+
+  /* gradient contribution to free energy */
+  fe_st_compute_gradient_fed(fe, r, dr, &fed); 
+
+  /* gradient contribtion to stress using the above contributions */
+
+  p0 = 0.0 - fed;
+
+  /* The term in the isotropic pressure */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      sth[ia][ib] = -p0*d[ia][ib];
+    }
+  }
+
+  /* The antisymmetric piece q_ac h_cb - h_ac q_cb. We can
+   * rewrite it as q_ac h_bc - h_ac q_bc. */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      for (ic = 0; ic < 3; ic++) {
+	sth[ia][ib] += 0.0;//q[ia][ic]*h[ib][ic] - h[ia][ic]*q[ib][ic];
+      }
+    }
+  }
+
+  /* This is the minus sign. */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+	sth[ia][ib] = -sth[ia][ib];
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_str_symm
+ *
+ *  Symmetric stress. 
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_str_symm(fe_st_t * fe, int index,
+				       double s[3][3]) {
+  double r[3][3];
+  double h[3][3];
+  double dr[3][3][3];
+  double dsr[3][3];
+
+  assert(fe);
+  assert(fe->r);
+  assert(fe->dr);
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+  field_grad_tensor_delsq(fe->dr, index, dsr);
+
+  fe_st_compute_h(fe, r, dr, dsr, h);
+  fe_st_compute_stress(fe, r, dr, h, s);
+
+  if (fe->param->is_active) {
+    double dp[3][3];
+    double sa[3][3];
+    field_grad_vector_grad(fe->dp, index, dp);
+    fe_st_compute_stress_active(fe, r, dp, sa);
+    for (int ia = 0; ia < 3; ia++) {
+      for (int ib = 0; ib < 3; ib++) {
+	s[ia][ib] += sa[ia][ib];
+      }
+    }
+  }
+
+  /* Antisymmetric part is subtracted (added, with the -ve sign) */
+/*
+  for (int ia = 0; ia < 3; ia++) {
+    for (int ib = 0; ib < 3; ib++) {
+      for (int ic = 0; ic < 3; ic++) {
+	s[ia][ib] += q[ia][ic]*h[ib][ic] - h[ia][ic]*q[ib][ic];
+      }
+    }
+  }
+*/
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_str_anti
+ *
+ *  Antisymmetric part of the stress.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_str_anti(fe_st_t * fe, int index,
+				       double s[3][3]) {
+
+  int ia, ib, ic;
+  double r[3][3];
+  double h[3][3];
+  double dr[3][3][3];
+  double dsr[3][3];
+
+  assert(fe);
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+  field_grad_tensor_delsq(fe->dr, index, dsr);
+
+  fe_st_compute_h(fe, r, dr, dsr, h);
+
+  /* The antisymmetric piece q_ac h_cb - h_ac q_cb. We can
+//   * rewrite it as q_ac h_bc - h_ac q_bc. */
+//  /* With minus sign */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      s[ia][ib] = 0.0;
+      for (ic = 0; ic < 3; ic++) {
+//	s[ia][ib] -= (q[ia][ic]*h[ib][ic] - h[ia][ic]*q[ib][ic]);
+      }
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_stress
+ *
+ *  Compute the stress as a function of the r tensor, the r tensor
+ *  gradient and the molecular field.
+ *
+ *  Note the definition here has a minus sign included to allow
+ *  computation of the force as minus the divergence (which often
+ *  appears as plus in the liquid crystal literature). This is a
+ *  separate operation at the end to avoid confusion.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_compute_stress(fe_st_t * fe, double r[3][3],
+					     double dr[3][3][3],
+					     double h[3][3],
+					     double sth[3][3]) {
+  int ia, ib;
+//  int  id, ie;
+  double fed;
+//  double dk[3][3];
+  double k;
+//  int twod;
+//  double q0;
+//  double kappa0;
+//  double kappa1;
+//  double qh;
+  double p0;
+//  const double r3 = (1.0/3.0);
+  KRONECKER_DELTA_CHAR(d);
+//  LEVI_CIVITA_CHAR(e);
+
+  assert(fe);
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+  k = fe->param->k;
+//  twod = fe->param->twod;
+  /*Version I*/
+  /*
+  double lambda0;
+  lambda0 = fe->param->lambda0;
+  *//*
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      dk[ia][ib] = d[ia][ib];
+    }
+  }
+  if(twod==1) dk[1][1] = 0.0;
+*/
+  /* We have ignored the rho T term at the moment, assumed to be zero
+   * (in particular, it has no divergence if rho = const). */
+
+  fe_st_compute_fed(fe, r, dr, &fed);
+  p0 = 0.0 - fed;
+
+  /* The contraction Q_ab H_ab */
+
+  /* The term in the isotropic pressure */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      sth[ia][ib] = -p0*d[ia][ib];
+    }
+  }
+/*
+  double trR = r[0][0] + r[1][1] + r[2][2];
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {*/
+      /*Version I*/
+      /*sth[ia][ib] += k*(r[ia][ib] - lambda0*dk[ia][ib]);*/
+      /*Version II*/
+  /*    sth[ia][ib] += (2.0*k/trR)*(r[ia][ib] - 0.5*trR*dk[ia][ib]);
+    }
+  }
+*/
+  /*Version IV*/
+  double trR = r[0][0] + r[1][1];
+
+  for (ia = 0; ia < 3 - 1; ia++) {
+    for (ib = 0; ib < 3 - 1; ib++) {
+      sth[ia][ib] += (2.0*k/trR)*(r[ia][ib] - 0.5*trR*d[ia][ib]);
+    }
+  }
+
+  /* This is the minus sign. */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+	sth[ia][ib] = -sth[ia][ib];
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_stress_active
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_compute_stress_active(fe_st_t * fe,
+						    double r[3][3],
+						    double dp[3][3],
+						    double s[3][3]) {
+  int ia, ib;
+//  KRONECKER_DELTA_CHAR(d);
+#ifdef OLD_SITUATION
+  /* Previously comment said: -zeta*(q_ab - 1/3 d_ab)
+   * while code was           -zeta*(q[ia][ib] + r3*d[ia][ib])
+   * for zeta = zeta1 */
+  /* The sign of zeta0 needs to be clarified cf Eq. 36 of notes */
+  /* For "backwards compatability" use zeta0 = +1/3 at the moment */
+
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      s[ia][ib] = -fe->param->zeta1*(q[ia][ib] + fe->param->zeta0*d[ia][ib])
+//                -  fe->param->zeta2*(dp[ia][ib] + dp[ib][ia]);
+//    }
+//  }
+#else
+  /* The documented approach */
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      s[ia][ib] = 0.0;//
+		 // fe->param->zeta0*d[ia][ib]
+	         //- fe->param->zeta1*q[ia][ib]
+	         //- fe->param->zeta2*(dp[ia][ib] + dp[ib][ia]);
+    }
+  }
+#endif
+
+  /* This is an extra minus sign for the divergance. */
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+	s[ia][ib] = -s[ia][ib];
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_mol_field
+ *
+ *  Return the molcular field h[3][3] at lattice site index.
+ *
+ *  Note this is only valid in the one-constant approximation at
+ *  the moment (kappa0 = kappa1 = kappa).
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_mol_field(fe_st_t * fe, int index,
+					double h[3][3]) {
+
+  double r[3][3];
+  double dr[3][3][3];
+  double dsr[3][3];
+
+  assert(fe);
+
+  field_tensor(fe->r, index, r);
+  field_grad_tensor_grad(fe->dr, index, dr);
+  field_grad_tensor_delsq(fe->dr, index, dsr);
+
+  fe_st_compute_h(fe, r, dr, dsr, h);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_h
+ *
+ *  Compute the molcular field h from r, the r gradient tensor dr, and
+ *  the del^2 r tensor.
+ *
+ *  NOTE: gamma is potentially gamma(r) so does not come from the
+ *        fe->param
+ *
+ *****************************************************************************/
+
+__host__ __device__
+int fe_st_compute_h(fe_st_t * fe, double r[3][3],
+		    double dr[3][3][3],
+		    double dsr[3][3], double h[3][3]) {
+
+  int ia, ib, ic, id;
+
+//  double q0;              /* Redshifted value */
+//  double kappa0, kappa1;  /* Redshifted values */
+//  double q2;
+//  double e2;
+//  double eq;
+//  double sum;
+//  const double r3 = (1.0/3.0);
+//  KRONECKER_DELTA_CHAR(d);
+//  LEVI_CIVITA_CHAR(e);
+
+  assert(fe);
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+
+  /* From the bulk terms in the free energy... */
+
+//  q2 = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      q2 += q[ia][ib]*q[ia][ib];
+//    }
+//  }
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      sum = 0.0;
+//      for (ic = 0; ic < 3; ic++) {
+//	sum += q[ia][ic]*q[ib][ic];
+//      }
+//      h[ia][ib] = -fe->param->a0*(1.0 - r3*gamma)*q[ia][ib]
+//	+ fe->param->a0*gamma*(sum - r3*q2*d[ia][ib])
+//	- fe->param->a0*gamma*q2*q[ia][ib];
+//    }
+//  }
+
+//  /* From the gradient terms ... */
+//  /* First, the sum e_abc d_b Q_ca. With two permutations, we
+//   * may rewrite this as e_bca d_b Q_ca */
+//
+//  eq = 0.0;
+//  for (ib = 0; ib < 3; ib++) {
+//    for (ic = 0; ic < 3; ic++) {
+//      for (ia = 0; ia < 3; ia++) {
+//	eq += e[ib][ic][ia]*dq[ib][ic][ia];
+//      }
+//    }
+//  }
+//
+//  /* d_c Q_db written as d_c Q_bd etc */
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+//      sum = 0.0;
+      for (ic = 0; ic < 3; ic++) {
+	for (id = 0; id < 3; id++) {
+//	  sum +=
+//	    (e[ia][ic][id]*dq[ic][ib][id] + e[ib][ic][id]*dq[ic][ia][id]);
+	}
+      }
+//      h[ia][ib] += kappa0*dsq[ia][ib]
+//	- 2.0*kappa1*q0*sum + 4.0*r3*kappa1*q0*eq*d[ia][ib]
+//	- 4.0*kappa1*q0*q0*q[ia][ib];
+    }
+  }
+
+//  /* Electric field term */
+
+//  e2 = 0.0;
+//  for (ia = 0; ia < 3; ia++) {
+//    double ea = fe->param->e0[ia]*fe->param->coswt;
+//    e2 += ea*ea;
+//  }
+
+  for (ia = 0; ia < 3; ia++) {
+//    double ea = fe->param->e0[ia]*fe->param->coswt;
+    for (ib = 0; ib < 3; ib++) {
+//      double eb = fe->param->e0[ib]*fe->param->coswt;
+      h[ia][ib] = 0.0;// fe->param->epsilon*(ea*eb - r3*d[ia][ib]*e2);
+//      h[ia][ib] +=  fe->param->epsilon*(ea*eb - r3*d[ia][ib]*e2);
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_bulk_fed
+ *
+ *  Compute the bulk free energy density as a function of r.
+ *
+ *****************************************************************************/
+
+__host__ __device__
+int fe_st_compute_bulk_fed(fe_st_t * fe, double r[3][3], double * fed) {
+
+//  int ia;
+//  double q0;
+//  double kappa1;
+//  double q2, q3;
+//  const double r3 = 1.0/3.0;
+  double k;
+  //double lambda0;
+  double *lambda;
+  //double I2R;
+  //double detR;
+  double trR;
+
+  assert(fe);
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+  k = fe->param->k;
+  //lambda0 = fe->param->lambda0;
+
+//  q2 = 0.0;
+//
+//  /* Q_ab^2 */
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      q2 += q[ia][ib]*q[ia][ib];
+//    }
+//  }
+//
+//  /* Q_ab Q_bc Q_ca */
+//
+//  q3 = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      for (ic = 0; ic < 3; ic++) {
+//	/* We use here the fact that q[ic][ia] = q[ia][ic] */
+//	q3 += q[ia][ib]*q[ib][ic]*q[ia][ic];
+//      }
+//    }
+//  }
+//
+//  *fed = 0.5*fe->param->a0*(1.0 - r3*fe->param->gamma)*q2
+//    - r3*fe->param->a0*fe->param->gamma*q3
+//    + 0.25*fe->param->a0*fe->param->gamma*q2*q2;
+//
+//  /* Add terms quadratic in q from gradient free energy */ 
+//
+//  *fed += 0.5*kappa1*4.0*q0*q0*q2;
+
+  /* Tr(R_ab) */
+//  trR = 0.0;
+//  for (ia = 0; ia < 3; ia++) {
+//    trR += r[ia][ia];
+ // }
+
+  /*Version I*/
+  /* ln(det(R_ab)) */
+  /*
+  double detR, detaR, lndetaR;
+  int twod;
+  twod = fe->param->twod;
+  if(twod==0) {
+    detR = r[0][0]*(r[1][1]*r[2][2] - r[2][1]*r[1][2]);
+    detR -= r[0][1]*(r[1][0]*r[2][2]-r[2][0]*r[1][2]);
+    detR += r[0][2]*(r[1][0]*r[2][1]-r[2][0]*r[1][1]);
+    detaR = detR/(lambda0*lambda0*lambda0);
+  }
+  else {
+    detR = r[0][0]*r[2][2] - r[0][2]*r[2][0]; 
+    detaR = detR/(lambda0*lambda0);
+  }
+
+  lndetaR = log(detaR);
+
+  *fed = 0.5*k*(trR - lambda0*lndetaR);
+  */
+
+  /*Version II*/
+  //*fed = k*log(trR/lambda0);
+  /*Version III*/
+  //lambda = fe->param->lambda; 
+  //I2R = lambda[0]*lambda[1] + lambda[1]*lambda[2] + lambda[2]*lambda[0];
+  //detR= lambda[0]*lambda[1]*lambda[2];
+  //*fed = k*log(I2R/pow(detR,2.0/3.0));
+  /*Version IV*/
+  trR = r[0][0]+r[1][1];
+  lambda = fe->param->lambda; 
+  *fed = k*log(trR/lambda[0]);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_gradient_fed
+ *
+ *  Compute the gradient contribution to the free energy density 
+ *  as a function of r and the r gradient tensor dr.
+ *
+ *  Note: The part quadratic in q has been added to the bulk free energy.
+ *
+ *****************************************************************************/
+
+__host__ __device__
+int fe_st_compute_gradient_fed(fe_st_t * fe, double r[3][3],
+			       double dr[3][3][3], double * fed) {
+
+//  int ia, ib, ic, id;
+//  double q0;
+//  double kappa0, kappa1;
+//  double dq0, dq1;
+//  double q2;
+//  double sum;
+//  LEVI_CIVITA_CHAR(e);
+
+  assert(fe);
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+
+  /* (d_b Q_ab)^2 */
+
+//  dq0 = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    sum = 0.0;
+//    for (ib = 0; ib < 3; ib++) {
+//      sum += dq[ib][ia][ib];
+//    }
+//    dq0 += sum*sum;
+//  }
+
+  /* (e_acd d_c Q_db + 2q_0 Q_ab)^2 */
+  /* With symmetric Q_db write Q_bd */
+
+//  dq1 = 0.0;
+//  q2 = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//
+//      sum = 0.0;
+//  
+//      q2 += q[ia][ib]*q[ia][ib];
+//
+//      for (ic = 0; ic < 3; ic++) {
+//	for (id = 0; id < 3; id++) {
+//	  sum += e[ia][ic][id]*dq[ic][ib][id];
+//	}
+//      }
+//      sum += 2.0*q0*q[ia][ib];
+//      dq1 += sum*sum;
+//    }
+//  }
+//
+//  /* Subtract part that is quadratic in q */
+//  dq1 -= 4.0*q0*q0*q2;
+
+  *fed = 0.0;
+//  *fed = 0.5*kappa0*dq0 + 0.5*kappa1*dq1;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_chirality
+ *
+ *  Return the chirality, which is defined here as
+ *         sqrt(108 \kappa_0 q_0^2 / A_0 \gamma)
+ *
+ *  Not dependent on the redshift.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_chirality(fe_st_t * fe, double * chirality) {
+
+//  double a0;
+//  double gamma;
+//  double kappa0;
+//  double q0;
+
+  assert(fe);
+  assert(chirality);
+
+//  a0     = fe->param->a0;
+//  gamma  = fe->param->gamma;
+//  kappa0 = fe->param->kappa0;
+//  q0     = fe->param->q0;
+//
+//  *chirality = sqrt(108.0*kappa0*q0*q0 / (a0*gamma));
+  *chirality = 0.0;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_reduced_temperature
+ *
+ *  Return the the reduced temperature defined here as
+ *       27*(1 - \gamma/3) / \gamma
+ *
+ *****************************************************************************/
+
+__host__ __device__
+int fe_st_reduced_temperature(fe_st_t * fe, double * tau) {
+
+//  double gamma;
+
+  assert(fe);
+  assert(tau);
+
+//  gamma = fe->param->gamma;
+//  *tau = 27.0*(1.0 - gamma/3.0) / gamma;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_dimensonless_field_strength
+ *
+ *  Return the dimensionless (or reduced) field strength which is
+ *      ered^2 = (27 epsilon / 32 pi A_O gamma) E_a E_a
+ *
+ *  The external field is e0[3] in lattice units. No phase.
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_dimensionless_field_strength(const fe_st_param_t * param,
+						double * ered) {
+
+//  double fieldsq = 0.0;
+//  PI_DOUBLE(pi);
+
+  assert(param);
+
+//  for (int ia = 0; ia < 3; ia++) {
+//    fieldsq += param->e0[ia]*param->e0[ia];
+//  }
+
+  /* Remember epsilon is stored with factor (1/12pi) */ 
+
+//  {
+//    double a0 = param->a0;
+//    double gamma = param->gamma;
+//    double epsilon = 12.0*pi*param->epsilon;
+//
+//    *ered = sqrt(27.0*epsilon*fieldsq/(32.0*pi*a0*gamma));
+//  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_redshift
+ *
+ *  Return the redshift parameter.
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_redshift(fe_st_t * fe, double * redshift) {
+
+  assert(fe);
+  assert(redshift);
+
+  *redshift = fe->param->redshift;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_redshift_set
+ *
+ *  Set the redshift parameter (host only).
+ *
+ *****************************************************************************/
+
+__host__
+int fe_st_redshift_set(fe_st_t * fe,  double redshift) {
+
+  assert(fe);
+  assert(fabs(redshift) >= FE_ST_REDSHIFT_MIN);
+
+  fe->param->redshift = redshift;
+  fe->param->rredshift = 1.0/redshift;
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_amplitude_compute
+ *
+ *  Scalar order parameter in the nematic state, minimum of bulk free energy 
+ *
+ *****************************************************************************/
+
+__host__ __device__ int fe_st_amplitude_compute(const fe_st_param_t * param,
+						double * a) {
+
+  assert(a);
+  
+//  *a = (2.0/3.0)*(0.25 + 0.75*sqrt(1.0 - 8.0/(3.0*param->gamma)));
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  shape_tensor_isotropic
+ *
+ *****************************************************************************/
+
+__host__ __device__
+int fe_st_r_isotropic(fe_st_param_t * param, double r[3][3]) {
+
+  int ia, ib;
+  KRONECKER_DELTA_CHAR(d);
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      r[ia][ib] = d[ia][ib];
+    }
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  blue_phase_q_uniaxial
+ *
+ *  For given director n we return
+ *
+ *     Q_ab = (1/2) A (3 n_a n_b - d_ab)
+ *
+ *  where A gives the maximum amplitude of order on diagonalisation.
+ *
+ *  Note this is slightly different  from the definition in
+ *  Wright and Mermin (Eq. 4.3) where
+ *
+ *     Q_ab = (1/3) gamma (3 n_a n_b - d_ab)
+ *
+ *  and the magnitude of order is then (2/3) gamma.
+ *
+ *****************************************************************************/
+
+//__host__ __device__
+//int fe_lc_q_uniaxial(fe_lc_param_t * param, const double n[3], double q[3][3]) {
+//
+//  int ia, ib;
+//  KRONECKER_DELTA_CHAR(d);
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      q[ia][ib] = 0.5*param->amplitude0*(3.0*n[ia]*n[ib] - d[ia][ib]);
+//    }
+//  }
+//
+//  return 0;
+//}
+//
+/*****************************************************************************
+ *
+ *  fe_st_redshift_compute
+ *
+ *  Redshift adjustment. If this is required at all, it should be
+ *  done at every timestep. It gives rise to an Allreduce.
+ *
+ *  The redshift calculation uses the unredshifted values of the
+ *  free energy parameters kappa0, kappa1 and q0.
+ *
+ *  The term quadratic in gradients may be written F_ddQ
+ *
+ *     (1/2) [ kappa1 (d_a Q_bc)^2 - kappa1 (d_a Q_bc d_b Q_ac)
+ *           + kappa0 (d_b Q_ab)^2 ]
+ *
+ *  The linear term is F_dQ
+ *
+ *     2 q0 kappa1 Q_ab e_acg d_c Q_gb
+ *
+ *  The new redshift is computed as - F_dQ / 2 F_ddQ
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_redshift_compute(cs_t * cs, fe_st_t * fe) {
+
+//  int ic, jc, kc, index;
+//  int ia, ib, id, ig;
+//  int nlocal[3];
+//
+//  double q[3][3], dq[3][3][3];
+//
+//  double dq0, dq1, dq2, dq3, sum;
+//  double egrad_local[2], egrad[2];    /* Gradient terms for redshift calc. */
+//  double rnew;
+//
+//  MPI_Comm comm;
+//  LEVI_CIVITA_CHAR(e);
+//
+//  if (fe->param->is_redshift_updated == 0) return 0;
+
+  assert(cs);
+
+//  cs_cart_comm(cs, &comm);
+//  cs_nlocal(cs, nlocal);
+//
+//  egrad_local[0] = 0.0;
+//  egrad_local[1] = 0.0;
+//
+//  /* Accumulate the sums (all fluid) */
+//
+//  for (ic = 1; ic <= nlocal[X]; ic++) {
+//    for (jc = 1; jc <= nlocal[Y]; jc++) {
+//      for (kc = 1; kc <= nlocal[Z]; kc++) {
+//
+//	index = cs_index(cs, ic, jc, kc);
+//
+//	field_tensor(fe->q, index, q);
+//	field_grad_tensor_grad(fe->dq, index, dq);
+//
+//	/* kappa0 (d_b Q_ab)^2 */
+//
+//	dq0 = 0.0;
+//
+//	for (ia = 0; ia < 3; ia++) {
+//	  sum = 0.0;
+//	  for (ib = 0; ib < 3; ib++) {
+//	    sum += dq[ib][ia][ib];
+//	  }
+//	  dq0 += sum*sum;
+//	}
+//
+//	/* kappa1 (e_agd d_g Q_db + 2q_0 Q_ab)^2 */
+//
+//	dq1 = 0.0;
+//	dq2 = 0.0;
+//	dq3 = 0.0;
+//
+//	for (ia = 0; ia < 3; ia++) {
+//	  for (ib = 0; ib < 3; ib++) {
+//	    sum = 0.0;
+//	    for (ig = 0; ig < 3; ig++) {
+//	      dq1 += dq[ia][ib][ig]*dq[ia][ib][ig];
+//	      dq2 += dq[ia][ib][ig]*dq[ib][ia][ig];
+//	      for (id = 0; id < 3; id++) {
+//		sum += e[ia][ig][id]*dq[ig][id][ib];
+//	      }
+//	    }
+//	    dq3 += q[ia][ib]*sum;
+//	  }
+//	}
+//
+//	/* linear gradient and square gradient terms */
+//
+//	egrad_local[0] += 2.0*fe->param->q0*fe->param->kappa1*dq3;
+//	egrad_local[1] += 0.5*(fe->param->kappa1*dq1 - fe->param->kappa1*dq2
+//			       + fe->param->kappa0*dq0);
+//
+//      }
+//    }
+//  }
+//
+//  /* Allreduce the gradient results, and compute a new redshift (we
+//   * keep the old one if problematic). */
+//
+//  MPI_Allreduce(egrad_local, egrad, 2, MPI_DOUBLE, MPI_SUM, comm);
+//
+//  rnew = fe->param->redshift;
+//  if (egrad[1] != 0.0) rnew = -0.5*egrad[0]/egrad[1];
+//  if (fabs(rnew) < FE_REDSHIFT_MIN) rnew = fe->param->redshift;
+//
+//  fe_lc_redshift_set(fe, rnew);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  fe_lc_scalar_ops
+ *
+ *  For symmetric traceless q[3][3], return the associated scalar
+ *  order parameter, biaxial order parameter and director:
+ *
+ *  qs[0]  scalar order parameter: largest eigenvalue
+ *  qs[1]  director[X] (associated eigenvector)
+ *  qs[2]  director[Y]
+ *  qs[3]  director[Z]
+ *  qs[4]  biaxial order parameter b = sqrt(1 - 6 (Tr(QQQ))^2 / Tr(QQ)^3)
+ *         related to the two largest eigenvalues...
+ *
+ *  If we write Q = ((s, 0, 0), (0, t, 0), (0, 0, -s -t)) then
+ *
+ *    Tr(QQ)  = s^2 + t^2 + (s + t)^2
+ *    Tr(QQQ) = 3 s t (s + t)
+ *
+ *  If no diagonalisation is possible, all the results are set to zero.
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_scalar_ops(double r[3][3], double rs[NRAB]) {
+
+  int ifail;
+  double eigenvalue[3];
+  double eigenvector[3][3];
+//  double s, t;
+//  double q2, q3;
+//
+  ifail = util_jacobi_sort(r, eigenvalue, eigenvector);
+//
+//  qs[0] = 0.0; qs[1] = 0.0; qs[2] = 0.0; qs[3] = 0.0; qs[4] = 0.0;
+//
+//  if (ifail == 0) {
+//
+//    qs[0] = eigenvalue[0];
+//    qs[1] = eigenvector[X][0];
+//    qs[2] = eigenvector[Y][0];
+//    qs[3] = eigenvector[Z][0];
+//
+//    s = eigenvalue[0];
+//    t = eigenvalue[1];
+//
+//    q2 = s*s + t*t + (s + t)*(s + t);
+//    q3 = 3.0*s*t*(s + t);
+//    qs[4] = sqrt(1 - 6.0*q3*q3 / (q2*q2*q2));
+//  }
+
+  return ifail;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_active_stress
+ *
+ *  Driver to compute the zeta2 term in the active stress. This must
+ *  be done
+ *    1. after computation of order parameter gradient d_a Q_bc
+ *    2. before the final stress computation
+ *
+ *  The full active stress is written:
+ *
+ *  S_ab = zeta_0 d_ab - zeta_1 Q_ab - zeta_2 (d_a P_b + d_b P_a)
+ *
+ *  where P_a = Q_ak d_m Q_mk. The first two terms are simple to compute.
+ *
+ *  Computation of the zeta_2 term is split into two stages. Here, we
+ *  compute P_a from the existing Q_ab and gradient d_a Q_bc. We then
+ *  take the gradient of P_a. This allows the complete term to be
+ *  computed as part of the stress.
+ *
+ *****************************************************************************/
+
+__host__ int fe_st_active_stress(fe_st_t * fe) {
+
+//  int ic, jc, kc, index;
+//  int nlocal[3];
+//  int ia, im, ik;
+//
+//  double q[3][3];
+//  double dq[3][3][3];
+//  double p[3];
+
+  assert(fe);
+
+//  if (fe->param->zeta2 == 0.0) return 0;
+
+  assert(fe->p);
+  assert(fe->dp);
+
+//  cs_nlocal(fe->cs, nlocal);
+
+  /* compute p_a */
+
+//  for (ic = 1; ic <= nlocal[X]; ic++) {
+//    for (jc = 1; jc <= nlocal[Y]; jc++) {
+//      for (kc = 1; kc <= nlocal[Z]; kc++) {
+//
+//	index = cs_index(fe->cs, ic, jc, kc);
+//	field_tensor(fe->q, index, q);
+//	field_grad_tensor_grad(fe->dq, index, dq);
+//
+//	for (ia = 0; ia < 3; ia++) {
+//	  p[ia] = 0.0;
+//	  for (ik = 0; ik < 3; ik++) {
+//	    for (im = 0; im < 3; im++) {
+//	      p[ia] += q[ia][ik]*dq[im][im][ik];
+//	    }
+//	  }
+//	}
+//
+//	field_vector_set(fe->p, index, p);
+//        /* Next site */
+//      }
+//    }
+//  }
+//
+//  field_halo(fe->p);
+//  fe->dp->d2 = fe->dq->d2; /* Kludge - set same gradient for dp */
+//  field_grad_compute(fe->dp);
+
+  return 0;
+}
+
+
+/*****************************************************************************
+ *
+ *  fe_st_mol_field_v
+ *
+ *****************************************************************************/
+
+__host__ __device__
+void fe_st_mol_field_v(fe_st_t * fe, int index, double h[3][3][NSIMDVL]) {
+
+  int ia, iv;
+
+  double r[3][3][NSIMDVL];
+  double dr[3][3][3][NSIMDVL];
+  double dsr[3][3][NSIMDVL];
+
+  double * __restrict__ data;
+  double * __restrict__ grad;
+  double * __restrict__ delsq;
+
+  assert(fe);
+ 
+  data = fe->r->data;
+  grad = fe->dr->grad;
+  delsq = fe->dr->delsq;
+
+  /* Expand various tensors */
+
+  for_simd_v(iv, NSIMDVL) r[X][X][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,XX)];
+  for_simd_v(iv, NSIMDVL) r[X][Y][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,XY)];
+  for_simd_v(iv, NSIMDVL) r[X][Z][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,XZ)];
+  for_simd_v(iv, NSIMDVL) r[Y][X][iv] = r[X][Y][iv];
+  for_simd_v(iv, NSIMDVL) r[Y][Y][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,YY)];
+  for_simd_v(iv, NSIMDVL) r[Y][Z][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,YZ)];
+  for_simd_v(iv, NSIMDVL) r[Z][X][iv] = r[X][Z][iv];
+  for_simd_v(iv, NSIMDVL) r[Z][Y][iv] = r[Y][Z][iv];
+  for_simd_v(iv, NSIMDVL) r[Z][Z][iv] = data[addr_rank1(fe->r->nsites,NRAB,index+iv,ZZ)];
+  //for_simd_v(iv, NSIMDVL) r[Z][Z][iv] = 0.0 - q[X][X][iv] - q[Y][Y][iv];
+
+
+  for (ia = 0; ia < NVECTOR; ia++) {
+    for_simd_v(iv, NSIMDVL) dr[ia][X][X][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,XX,ia)];
+    for_simd_v(iv, NSIMDVL) dr[ia][X][Y][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,XY,ia)];
+    for_simd_v(iv, NSIMDVL) dr[ia][X][Z][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,XZ,ia)];
+    for_simd_v(iv, NSIMDVL) dr[ia][Y][X][iv] = dr[ia][X][Y][iv];
+    for_simd_v(iv, NSIMDVL) dr[ia][Y][Y][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,YY,ia)];
+    for_simd_v(iv, NSIMDVL) dr[ia][Y][Z][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,YZ,ia)];
+    for_simd_v(iv, NSIMDVL) dr[ia][Z][X][iv] = dr[ia][X][Z][iv];
+    for_simd_v(iv, NSIMDVL) dr[ia][Z][Y][iv] = dr[ia][Y][Z][iv];
+    for_simd_v(iv, NSIMDVL) dr[ia][Z][Z][iv] = grad[addr_rank2(fe->r->nsites,NRAB,NVECTOR,index+iv,ZZ,ia)];
+    //for_simd_v(iv, NSIMDVL) dr[ia][Z][Z][iv] = 0.0 - dq[ia][X][X][iv] - dq[ia][Y][Y][iv];
+  }
+
+  for_simd_v(iv, NSIMDVL) dsr[X][X][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,XX)];
+  for_simd_v(iv, NSIMDVL) dsr[X][Y][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,XY)];
+  for_simd_v(iv, NSIMDVL) dsr[X][Z][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,XZ)];
+  for_simd_v(iv, NSIMDVL) dsr[Y][X][iv] = dsr[X][Y][iv];
+  for_simd_v(iv, NSIMDVL) dsr[Y][Y][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,YY)];
+  for_simd_v(iv, NSIMDVL) dsr[Y][Z][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,YZ)];
+  for_simd_v(iv, NSIMDVL) dsr[Z][X][iv] = dsr[X][Z][iv];
+  for_simd_v(iv, NSIMDVL) dsr[Z][Y][iv] = dsr[Y][Z][iv];
+  for_simd_v(iv, NSIMDVL) dsr[Z][Z][iv] = delsq[addr_rank1(fe->r->nsites,NRAB,index+iv,ZZ)];
+  //for_simd_v(iv, NSIMDVL) dsr[Z][Z][iv] = 0.0 - dsq[X][X][iv] - dsq[Y][Y][iv];
+
+
+  fe_st_compute_h_v(fe, r, dr, dsr, h);
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  fe_lc_stress_v
+ *
+ *  Vectorised version of fe_lc_stress
+ *
+ *****************************************************************************/
+
+__host__ __device__
+void fe_st_stress_v(fe_st_t * fe, int index, double s[3][3][NSIMDVL]) { 
+
+//  int iv;
+//  int ia;
+// 
+//  double q[3][3][NSIMDVL];
+//  double h[3][3][NSIMDVL];
+//  double dq[3][3][3][NSIMDVL];
+//  double dsq[3][3][NSIMDVL];
+//
+//  double * __restrict__ data;
+//  double * __restrict__ grad;
+//  double * __restrict__ delsq;
+
+  assert(fe);
+
+//  data = fe->q->data;
+//  grad = fe->dq->grad;
+//  delsq = fe->dq->delsq;
+//
+//  for_simd_v(iv, NSIMDVL) q[X][X][iv] = data[addr_rank1(fe->q->nsites,NQAB,index+iv,XX)];
+//  for_simd_v(iv, NSIMDVL) q[X][Y][iv] = data[addr_rank1(fe->q->nsites,NQAB,index+iv,XY)];
+//  for_simd_v(iv, NSIMDVL) q[X][Z][iv] = data[addr_rank1(fe->q->nsites,NQAB,index+iv,XZ)];
+//  for_simd_v(iv, NSIMDVL) q[Y][X][iv] = q[X][Y][iv];
+//  for_simd_v(iv, NSIMDVL) q[Y][Y][iv] = data[addr_rank1(fe->q->nsites,NQAB,index+iv,YY)];
+//  for_simd_v(iv, NSIMDVL) q[Y][Z][iv] = data[addr_rank1(fe->q->nsites,NQAB,index+iv,YZ)];
+//  for_simd_v(iv, NSIMDVL) q[Z][X][iv] = q[X][Z][iv];
+//  for_simd_v(iv, NSIMDVL) q[Z][Y][iv] = q[Y][Z][iv];
+//  for_simd_v(iv, NSIMDVL) q[Z][Z][iv] = 0.0 - q[X][X][iv] - q[Y][Y][iv];
+//
+//  for (ia = 0; ia < NVECTOR; ia++) {
+//    for_simd_v(iv, NSIMDVL) dq[ia][X][X][iv] = grad[addr_rank2(fe->q->nsites,NQAB,3,index+iv,XX,ia)];
+//    for_simd_v(iv, NSIMDVL) dq[ia][X][Y][iv] = grad[addr_rank2(fe->q->nsites,NQAB,3,index+iv,XY,ia)];
+//    for_simd_v(iv, NSIMDVL) dq[ia][X][Z][iv] = grad[addr_rank2(fe->q->nsites,NQAB,3,index+iv,XZ,ia)];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Y][X][iv] = dq[ia][X][Y][iv];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Y][Y][iv] = grad[addr_rank2(fe->q->nsites,NQAB,3,index+iv,YY,ia)];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Y][Z][iv] = grad[addr_rank2(fe->q->nsites,NQAB,3,index+iv,YZ,ia)];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Z][X][iv] = dq[ia][X][Z][iv];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Z][Y][iv] = dq[ia][Y][Z][iv];
+//    for_simd_v(iv, NSIMDVL) dq[ia][Z][Z][iv] = 0.0 - dq[ia][X][X][iv] - dq[ia][Y][Y][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) dsq[X][X][iv] = delsq[addr_rank1(fe->q->nsites,NQAB,index+iv,XX)];
+//  for_simd_v(iv, NSIMDVL) dsq[X][Y][iv] = delsq[addr_rank1(fe->q->nsites,NQAB,index+iv,XY)];
+//  for_simd_v(iv, NSIMDVL) dsq[X][Z][iv] = delsq[addr_rank1(fe->q->nsites,NQAB,index+iv,XZ)];
+//  for_simd_v(iv, NSIMDVL) dsq[Y][X][iv] = dsq[X][Y][iv];
+//  for_simd_v(iv, NSIMDVL) dsq[Y][Y][iv] = delsq[addr_rank1(fe->q->nsites,NQAB,index+iv,YY)];
+//  for_simd_v(iv, NSIMDVL) dsq[Y][Z][iv] = delsq[addr_rank1(fe->q->nsites,NQAB,index+iv,YZ)];
+//  for_simd_v(iv, NSIMDVL) dsq[Z][X][iv] = dsq[X][Z][iv];
+//  for_simd_v(iv, NSIMDVL) dsq[Z][Y][iv] = dsq[Y][Z][iv];
+//  for_simd_v(iv, NSIMDVL) dsq[Z][Z][iv] = 0.0 - dsq[X][X][iv] - dsq[Y][Y][iv];
+//
+//  fe_lc_compute_h_v(fe, q, dq, dsq, h);
+//#ifndef AMD_GPU_WORKAROUND
+//  /* Standard computation. */
+//  fe_lc_compute_stress_v(fe, q, dq, h, s);
+//#else
+//  {
+//    /* This is avoiding what appears to be a spurious memory access
+//     * error arising from the unrolled stress. It's not entirely
+//     * clear where this is coming form at the moment (beyond
+//     * "something to do with optimisation" */
+//    int ia, ib;
+//    double q1[3][3];
+//    double dq1[3][3][3];
+//    double h1[3][3];
+//    double s1[3][3];
+//
+//    for (iv = 0; iv < NSIMDVL; iv++) {
+//      for (ia = 0; ia < 3; ia++) {
+//	for (ib = 0; ib < 3; ib++) {
+//	  q1[ia][ib] = q[ia][ib][iv];
+//	  dq1[0][ia][ib] = dq[0][ia][ib][iv];
+//	  dq1[1][ia][ib] = dq[1][ia][ib][iv];
+//	  dq1[2][ia][ib] = dq[2][ia][ib][iv];
+//	  h1[ia][ib] = h[ia][ib][iv];
+//	}
+//      }
+//      fe_lc_compute_stress(fe, q1, dq1, h1, s1);
+//      for (ia = 0; ia < 3; ia++) {
+//	for (ib = 0; ib < 3; ib++) {
+//	  s[ia][ib][iv] = s1[ia][ib];
+//	}
+//      }
+//    }
+//  }
+//#endif
+//
+//  if (fe->param->is_active) {
+//    int ib;
+//    double dp[3][3];
+//    double sa[3][3];
+//    double q1[3][3];
+//    for (iv = 0; iv < NSIMDVL; iv++) {
+//      field_grad_vector_grad(fe->dp, index + iv, dp);
+//      for (ia = 0; ia < 3; ia++) {
+//	for (ib = 0; ib < 3; ib++) {
+//	  q1[ia][ib] = q[ia][ib][iv];
+//	}
+//      }
+//      fe_lc_compute_stress_active(fe, q1, dp, sa);
+//      for (ia = 0; ia < 3; ia++) {
+//	for (ib = 0; ib < 3; ib++) {
+//	  s[ia][ib][iv] += sa[ia][ib];
+//	}
+//      }
+//    }
+//  }
+
+printf("Not expected to reach here in vectorization\n");
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_str_symm_v
+ *
+ *****************************************************************************/
+
+__host__ __device__ void fe_st_str_symm_v(fe_st_t * fe, int index,
+			 		  double s[3][3][NSIMDVL]) {
+
+//  int ia, ib, iv;
+//  double s1[3][3];
+
+  assert(fe);
+
+//  for (iv = 0; iv < NSIMDVL; iv++) {
+//    fe_lc_str_symm(fe, index + iv, s1);
+//    for (ia = 0; ia < 3; ia++) {
+//      for (ib = 0; ib < 3; ib++) {
+//	s[ia][ib][iv] = s1[ia][ib];
+//      }
+//    }
+//  }
+printf("Not expected to reach here in vectorization\n");
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_str_anti_v
+ *
+ *****************************************************************************/
+
+__host__ __device__ void fe_st_str_anti_v(fe_st_t * fe, int index,
+			 		  double s[3][3][NSIMDVL]) {
+  assert(fe);
+
+//  int ia, ib, iv;
+//  double s1[3][3];
+
+  assert(fe);
+
+//  for (iv = 0; iv < NSIMDVL; iv++) {
+//    fe_lc_str_anti(fe, index + iv, s1);
+//    for (ia = 0; ia < 3; ia++) {
+//      for (ib = 0; ib < 3; ib++) {
+//	s[ia][ib][iv] = s1[ia][ib];
+//      }
+//    }
+//  }
+printf("Not expected to reach here in vectorization\n");
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_fed_v
+ *
+ *  Vectorised version of fe_st_dompute_fed().
+ *
+ *  NO gamma = gamma(r) at the moment.
+ *
+ ****************************************************************************/
+
+__host__ __device__
+void fe_st_compute_fed_v(fe_st_t * fe,
+			 double r[3][3][NSIMDVL], 
+			 double dr[3][3][3][NSIMDVL],
+			 double fed[NSIMDVL]) {
+//  int iv;
+//  int ia, ib, ic;
+
+//  double q0;
+//  double kappa0;
+//  double kappa1;
+
+//  double sum[NSIMDVL];
+//  double q2[NSIMDVL], q3[NSIMDVL];
+//  double dq0[NSIMDVL], dq1[NSIMDVL];
+//  double efield[NSIMDVL];
+//  const double r3 = 1.0/3.0;
+
+  assert(fe);
+
+  /* Redshifted values */
+//  q0 = fe->param->rredshift*fe->param->q0;
+//  kappa0 = fe->param->redshift*fe->param->redshift*fe->param->kappa0;
+//  kappa1 = kappa0;
+
+//  for_simd_v(iv, NSIMDVL) q2[iv] = 0.0;
+
+//  /* Q_ab^2 */
+
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      for_simd_v(iv, NSIMDVL)  q2[iv] += q[ia][ib][iv]*q[ia][ib][iv];
+//    }
+//  }
+
+  /* Q_ab Q_bc Q_ca */
+
+//  for_simd_v(iv, NSIMDVL) q3[iv] = 0.0;
+
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      for (ic = 0; ic < 3; ic++) {
+//	/* We use here the fact that q[ic][ia] = q[ia][ic] */
+//	for_simd_v(iv, NSIMDVL)  q3[iv] += q[ia][ib][iv]*q[ib][ic][iv]*q[ia][ic][iv];
+//      }
+//    }
+//  }
+//
+//  /* (d_b Q_ab)^2 */
+//
+//  for_simd_v(iv, NSIMDVL)  dq0[iv] = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for_simd_v(iv, NSIMDVL)  sum[iv] = 0.0;
+//    for (ib = 0; ib < 3; ib++) {
+//      for_simd_v(iv, NSIMDVL)  sum[iv] += dq[ib][ia][ib][iv];
+//    }
+//    for_simd_v(iv, NSIMDVL)  dq0[iv] += sum[iv]*sum[iv];
+//  }
+//
+//  /* (e_acd d_c Q_db + 2q_0 Q_ab)^2 */
+//  /* With symmetric Q_db write Q_bd */
+//
+//  for_simd_v(iv, NSIMDVL)  dq1[iv] = 0.0;
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][0][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[2][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][1][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[2][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][2][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[2][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[0][0][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[0][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[0][2][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][0][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[1][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][1][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[1][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][2][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] -= dq[1][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] += 2.0*q0*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) dq1[iv] += sum[iv]*sum[iv];
+//
+//
+//  /* Electric field term (epsilon_ includes the factor 1/12pi) */
+//
+//  for_simd_v(iv, NSIMDVL)  efield[iv] = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    double ea = fe->param->e0[ia]*fe->param->coswt;
+//    for (ib = 0; ib < 3; ib++) {
+//      double eb = fe->param->e0[ib]*fe->param->coswt;
+//      for_simd_v(iv, NSIMDVL) {
+//	efield[iv] += ea*q[ia][ib][iv]*eb;
+//      }
+//    }
+//  }
+//
+//
+//  for_simd_v(iv, NSIMDVL) {
+//    fed[iv] = 0.5*fe->param->a0*(1.0 - r3*fe->param->gamma)*q2[iv]
+//      - r3*fe->param->a0*fe->param->gamma*q3[iv]
+//      + 0.25*fe->param->a0*fe->param->gamma*q2[iv]*q2[iv]
+//      + 0.5*kappa0*dq0[iv] + 0.5*kappa1*dq1[iv]
+//      - fe->param->epsilon*efield[iv];
+//  }
+printf("Not expected to reach here in vectorization\n");
+
+  return;
+}
+
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_h_v
+ *
+ *  Vectorised version of the molecular field computation.
+ *
+ *  Alan's note for GPU version.
+ *
+ *  To get temperary r[][][] etc arrays into registers really requires
+ *  inlining to caller file scope.
+ *
+ *  NO gamma = gamma(r) at the mooment.
+ *
+ *****************************************************************************/
+
+__host__ __device__
+void fe_st_compute_h_v(fe_st_t * fe,
+		       double r[3][3][NSIMDVL], 
+		       double dr[3][3][3][NSIMDVL],
+		       double dsr[3][3][NSIMDVL], 
+		       double h[3][3][NSIMDVL]) {
+
+  int iv;
+  int ia, ib;
+//  double q0;
+//  double gamma;
+//  double kappa0;
+//  double kappa1;
+
+//  double q2[NSIMDVL];
+//  double e2[NSIMDVL];
+//  double edq[NSIMDVL];
+//  double sum[NSIMDVL];
+  double trR[NSIMDVL];
+  double *lambda;
+  //double lambda0;
+
+//  const double r3 = (1.0/3.0);
+  KRONECKER_DELTA_CHAR(d);
+//  LEVI_CIVITA_CHAR(e);
+
+  /* Redshifted values */
+//  q0 = fe->param->rredshift*fe->param->q0;
+//  kappa0 = fe->param->redshift*fe->param->redshift*fe->param->kappa0;
+//  kappa1 = kappa0;
+
+//  gamma = fe->param->gamma;
+
+  /* From the bulk terms in the free energy... */
+
+//  for_simd_v(iv, NSIMDVL) q2[iv] = 0.0;
+
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      for_simd_v(iv, NSIMDVL) q2[iv] += q[ia][ib][iv]*q[ia][ib][iv];
+//    }
+//  }
+      /*Version II*/
+  //double dk[3][3];
+  /*proxy for Kronecker delta to use in 2D shape tensor*/
+  /*for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      dk[ia][ib] = d[ia][ib];
+    }
+  }
+  if (fe->param->twod==1) {dk[1][1] = 0.0;}
+*//*
+  lambda0 =  fe->param->lambda0;
+  for_simd_v(iv, NSIMDVL) trR[iv] = r[0][0][iv] + r[1][1][iv] + r[2][2][iv];
+
+  for (ia = 0; ia < 3; ia++) {
+    for (ib = 0; ib < 3; ib++) {
+      //Version
+      //for_simd_v(iv, NSIMDVL) h[ia][ib][iv] = fe->param->k*(fe->param->lambda0*dk[ia][ib] - r[ia][ib][iv]);
+      for_simd_v(iv, NSIMDVL) h[ia][ib][iv] = (fe->param->k)*(lambda0*lambda0*dk[ia][ib]/trR[iv] - 0.5*r[ia][ib][iv]);
+    }
+  }
+*/
+      /*Version IV*/
+  for_simd_v(iv, NSIMDVL) trR[iv] = r[0][0][iv] + r[1][1][iv];
+  lambda =  fe->param->lambda;
+
+  for (ia = 0; ia < 3 - 1; ia++) {
+    for (ib = 0; ib < 3 - 1; ib++) {
+      for_simd_v(iv, NSIMDVL) h[ia][ib][iv] = (fe->param->k)*(lambda[0]*lambda[0]*d[ia][ib]/trR[iv] - 0.5*r[ia][ib][iv]);
+    }
+  }
+
+  /* From the gradient terms ... */
+  /* First, the sum e_abc d_b Q_ca. With two permutations, we
+   * may rewrite this as e_bca d_b Q_ca */
+
+//  for_simd_v(iv, NSIMDVL) edq[iv] = 0.0;
+//
+//  for (ib = 0; ib < 3; ib++) {
+//    for (ic = 0; ic < 3; ic++) {
+//      for (ia = 0; ia < 3; ia++) {
+//	for_simd_v(iv, NSIMDVL) edq[iv] += e[ib][ic][ia]*dq[ib][ic][ia][iv];
+//      }
+//    }
+//  }
+//
+//  /* Contraction d_c Q_db ... */
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][0][2][iv] + dq[1][0][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[2][0][1][iv] + -dq[2][0][1][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[0][0][iv] += kappa0*dsq[0][0][iv] - 2.0*kappa1*q0*sum[iv]
+//      + 4.0*r3*kappa1*q0*edq[iv] - 4.0*kappa1*q0*q0*q[0][0][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[0][0][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][1][2][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][0][0][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[2][1][1][iv] ;
+//  for_simd_v(iv, NSIMDVL) {
+//    h[0][1][iv] += kappa0*dsq[0][1][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[0][1][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][0][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[1][0][0][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][2][2][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[2][2][1][iv] ;
+//  for_simd_v(iv, NSIMDVL) {
+//    h[0][2][iv] += kappa0*dsq[0][2][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[0][2][iv];
+//    }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[0][0][2][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][1][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][0][0][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[2][1][1][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[1][0][iv] += kappa0*dsq[1][0][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[1][0][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[0][1][2][iv] + -dq[0][1][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][1][0][iv] + dq[2][1][0][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[1][1][iv] += kappa0*dsq[1][1][iv] - 2.0*kappa1*q0*sum[iv]
+//      + 4.0*r3*kappa1*q0*edq[iv] - 4.0*kappa1*q0*q0*q[1][1][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][1][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[0][2][2][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[1][1][0][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][2][0][iv] ;
+//  for_simd_v(iv, NSIMDVL) {
+//    h[1][2][iv] += kappa0*dsq[1][2][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[1][2][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][0][1][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[1][0][0][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[1][2][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[2][2][1][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[2][0][iv] += kappa0*dsq[2][0][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[2][0][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][1][1][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[0][2][2][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[1][1][0][iv] ;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[2][2][0][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[2][1][iv] += kappa0*dsq[2][1][iv] - 2.0*kappa1*q0*sum[iv]
+//      - 4.0*kappa1*q0*q0*q[2][1][iv];
+//  }
+//
+//  for_simd_v(iv, NSIMDVL) sum[iv] = 0.0;
+//  for_simd_v(iv, NSIMDVL) sum[iv] += dq[0][2][1][iv] + dq[0][2][1][iv];
+//  for_simd_v(iv, NSIMDVL) sum[iv] += -dq[1][2][0][iv] + -dq[1][2][0][iv];
+//  for_simd_v(iv, NSIMDVL) {
+//    h[2][2][iv] += kappa0*dsq[2][2][iv] - 2.0*kappa1*q0*sum[iv]
+//      + 4.0*r3*kappa1*q0*edq[iv] - 4.0*kappa1*q0*q0*q[2][2][iv];
+//  }
+//
+//  /* Electric field term */
+//
+//  for_simd_v(iv, NSIMDVL) e2[iv] = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    double ea = fe->param->e0[ia]*fe->param->coswt;
+//    for_simd_v(iv, NSIMDVL) {
+//      e2[iv] += ea*ea;
+//    }
+//  }
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    double ea = fe->param->e0[ia]*fe->param->coswt;
+//    for (ib = 0; ib < 3; ib++) {
+//      double eb = fe->param->e0[ib]*fe->param->coswt;
+//      for_simd_v(iv, NSIMDVL) {
+//	h[ia][ib][iv] +=  fe->param->epsilon*(ea*eb - r3*d[ia][ib]*e2[iv]);
+//      }
+//    }
+//  }
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  fe_st_compute_stress_v
+ *
+ *  Vectorised version of fe_st_compute_stress()
+ *
+ *****************************************************************************/
+
+__host__ __device__
+void fe_st_compute_stress_v(fe_st_t * fe,
+			    double r[3][3][NSIMDVL],
+			    double dr[3][3][3][NSIMDVL],
+			    double h[3][3][NSIMDVL],
+			    double s[3][3][NSIMDVL]) {
+//  int ia, ib;
+//  int iv;
+
+//  double kappa0;
+//  double kappa1;
+//  double q0;
+//  double xi;
+
+//  double qh[NSIMDVL];
+//  double p0[NSIMDVL];
+//  double sthtmp[NSIMDVL];
+
+//  const double r3 = (1.0/3.0);
+
+  /* Redshifted values */
+
+//  q0 = fe->param->q0*fe->param->rredshift;
+//  kappa0 = fe->param->kappa0*fe->param->redshift*fe->param->redshift;
+//  kappa1 = fe->param->kappa1*fe->param->redshift*fe->param->redshift;
+//
+//  xi = fe->param->xi;
+//
+//  /* We have ignored the rho T term at the moment, assumed to be zero
+//     (in particular, it has no divergence if rho = const). */
+//
+//  fe_lc_compute_fed_v(fe, q, dq, p0);
+//
+//  for_simd_v(iv, NSIMDVL) p0[iv] = 0.0 - p0[iv]; 
+//
+//  /* The contraction Q_ab H_ab */
+//
+//  for_simd_v(iv, NSIMDVL) qh[iv] = 0.0;
+//
+//  for (ia = 0; ia < 3; ia++) {
+//    for (ib = 0; ib < 3; ib++) {
+//      for_simd_v(iv, NSIMDVL) qh[iv] += q[ia][ib][iv]*h[ia][ib][iv];
+//    }
+//  }
+//
+//  /* The rest is automatically generated following
+//   * fe_lc_compute_stress() */
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[0][0][iv]+ r3)*qh[iv] -p0[iv] ;
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][0][iv]*(q[0][0][iv] + r3)   -xi*(q[0][0][iv]    +r3)*h[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][1][iv]*(q[0][1][iv])   -xi*(q[0][1][iv]    )*h[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][2][iv]*(q[0][2][iv])   -xi*(q[0][2][iv]    )*h[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][0][iv]*dq[0][0][0][iv] - kappa1*dq[0][0][0][iv]*dq[0][0][0][iv]+ kappa1*dq[0][0][0][iv]*dq[0][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][0][iv]*dq[1][0][1][iv] - kappa1*dq[0][0][1][iv]*dq[0][0][1][iv]+ kappa1*dq[0][0][1][iv]*dq[0][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][0][iv]*dq[2][0][2][iv] - kappa1*dq[0][0][2][iv]*dq[0][0][2][iv]+ kappa1*dq[0][0][2][iv]*dq[0][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][1][iv]*dq[0][1][0][iv] - kappa1*dq[0][1][0][iv]*dq[0][1][0][iv]+ kappa1*dq[0][1][0][iv]*dq[1][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][1][0][iv]*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][1][iv]*dq[1][1][1][iv] - kappa1*dq[0][1][1][iv]*dq[0][1][1][iv]+ kappa1*dq[0][1][1][iv]*dq[1][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][1][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][1][iv]*dq[2][1][2][iv] - kappa1*dq[0][1][2][iv]*dq[0][1][2][iv]+ kappa1*dq[0][1][2][iv]*dq[1][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][1][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][2][iv]*dq[0][2][0][iv] - kappa1*dq[0][2][0][iv]*dq[0][2][0][iv]+ kappa1*dq[0][2][0][iv]*dq[2][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][2][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][2][iv]*dq[1][2][1][iv] - kappa1*dq[0][2][1][iv]*dq[0][2][1][iv]+ kappa1*dq[0][2][1][iv]*dq[2][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][2][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][0][2][iv]*dq[2][2][2][iv] - kappa1*dq[0][2][2][iv]*dq[0][2][2][iv]+ kappa1*dq[0][2][2][iv]*dq[2][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][2][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][0][iv]*h[0][0][iv] - h[0][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][1][iv]*h[0][1][iv] - h[0][1][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][2][iv]*h[0][2][iv] - h[0][2][iv]*q[0][2][iv];
+//
+//
+//  /* XX -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[X][X][iv] = -sthtmp[iv];
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[0][1][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][0][iv]*(q[1][0][iv])   -xi*(q[0][0][iv]    +r3)*h[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][1][iv]*(q[1][1][iv] + r3)   -xi*(q[0][1][iv]    )*h[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][2][iv]*(q[1][2][iv])   -xi*(q[0][2][iv]    )*h[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][0][iv]*dq[0][0][0][iv] - kappa1*dq[0][0][0][iv]*dq[1][0][0][iv]+ kappa1*dq[0][0][0][iv]*dq[0][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][0][0][iv]*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][0][iv]*dq[1][0][1][iv] - kappa1*dq[0][0][1][iv]*dq[1][0][1][iv]+ kappa1*dq[0][0][1][iv]*dq[0][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][0][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][0][iv]*dq[2][0][2][iv] - kappa1*dq[0][0][2][iv]*dq[1][0][2][iv]+ kappa1*dq[0][0][2][iv]*dq[0][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][0][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][1][iv]*dq[0][1][0][iv] - kappa1*dq[0][1][0][iv]*dq[1][1][0][iv]+ kappa1*dq[0][1][0][iv]*dq[1][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][1][iv]*dq[1][1][1][iv] - kappa1*dq[0][1][1][iv]*dq[1][1][1][iv]+ kappa1*dq[0][1][1][iv]*dq[1][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][1][iv]*dq[2][1][2][iv] - kappa1*dq[0][1][2][iv]*dq[1][1][2][iv]+ kappa1*dq[0][1][2][iv]*dq[1][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][2][iv]*dq[0][2][0][iv] - kappa1*dq[0][2][0][iv]*dq[1][2][0][iv]+ kappa1*dq[0][2][0][iv]*dq[2][1][0][iv];
+//    
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][2][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][2][iv]*dq[1][2][1][iv] - kappa1*dq[0][2][1][iv]*dq[1][2][1][iv]+ kappa1*dq[0][2][1][iv]*dq[2][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][2][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][1][2][iv]*dq[2][2][2][iv] - kappa1*dq[0][2][2][iv]*dq[1][2][2][iv]+ kappa1*dq[0][2][2][iv]*dq[2][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][2][2][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][0][iv]*h[1][0][iv] - h[0][0][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][1][iv]*h[1][1][iv] - h[0][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][2][iv]*h[1][2][iv] - h[0][2][iv]*q[1][2][iv];
+//
+//
+//  /* XY with minus sign */
+//  for_simd_v(iv, NSIMDVL) s[X][Y][iv] = -sthtmp[iv];
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[0][2][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][0][iv]*(q[2][0][iv])   -xi*(q[0][0][iv]    +r3)*h[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][1][iv]*(q[2][1][iv])   -xi*(q[0][1][iv]    )*h[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[0][2][iv]*(q[2][2][iv] + r3)   -xi*(q[0][2][iv]    )*h[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][0][iv]*dq[0][0][0][iv] - kappa1*dq[0][0][0][iv]*dq[2][0][0][iv]+ kappa1*dq[0][0][0][iv]*dq[0][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][0][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][0][iv]*dq[1][0][1][iv] - kappa1*dq[0][0][1][iv]*dq[2][0][1][iv]+ kappa1*dq[0][0][1][iv]*dq[0][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][0][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][0][iv]*dq[2][0][2][iv] - kappa1*dq[0][0][2][iv]*dq[2][0][2][iv]+ kappa1*dq[0][0][2][iv]*dq[0][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[0][0][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][1][iv]*dq[0][1][0][iv] - kappa1*dq[0][1][0][iv]*dq[2][1][0][iv]+ kappa1*dq[0][1][0][iv]*dq[1][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][1][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][1][iv]*dq[1][1][1][iv] - kappa1*dq[0][1][1][iv]*dq[2][1][1][iv]+ kappa1*dq[0][1][1][iv]*dq[1][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][1][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][1][iv]*dq[2][1][2][iv] - kappa1*dq[0][1][2][iv]*dq[2][1][2][iv]+ kappa1*dq[0][1][2][iv]*dq[1][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[0][1][2][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][2][iv]*dq[0][2][0][iv] - kappa1*dq[0][2][0][iv]*dq[2][2][0][iv]+ kappa1*dq[0][2][0][iv]*dq[2][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][2][iv]*dq[1][2][1][iv] - kappa1*dq[0][2][1][iv]*dq[2][2][1][iv]+ kappa1*dq[0][2][1][iv]*dq[2][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[0][2][2][iv]*dq[2][2][2][iv] - kappa1*dq[0][2][2][iv]*dq[2][2][2][iv]+ kappa1*dq[0][2][2][iv]*dq[2][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][0][iv]*h[2][0][iv] - h[0][0][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][1][iv]*h[2][1][iv] - h[0][1][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[0][2][iv]*h[2][2][iv] - h[0][2][iv]*q[2][2][iv];
+//
+//
+//  /* XZ with -ve sign*/
+//  for_simd_v(iv, NSIMDVL) s[X][Z][iv] = -sthtmp[iv];
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[1][0][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][0][iv]*(q[0][0][iv] + r3)   -xi*(q[1][0][iv]    )*h[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][1][iv]*(q[0][1][iv])   -xi*(q[1][1][iv]    +r3)*h[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][2][iv]*(q[0][2][iv])   -xi*(q[1][2][iv]    )*h[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][0][iv]*dq[0][0][0][iv] - kappa1*dq[1][0][0][iv]*dq[0][0][0][iv]+ kappa1*dq[1][0][0][iv]*dq[0][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][0][iv]*dq[1][0][1][iv] - kappa1*dq[1][0][1][iv]*dq[0][0][1][iv]+ kappa1*dq[1][0][1][iv]*dq[0][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][0][iv]*dq[2][0][2][iv] - kappa1*dq[1][0][2][iv]*dq[0][0][2][iv]+ kappa1*dq[1][0][2][iv]*dq[0][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][1][iv]*dq[0][1][0][iv] - kappa1*dq[1][1][0][iv]*dq[0][1][0][iv]+ kappa1*dq[1][1][0][iv]*dq[1][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][1][0][iv]*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][1][iv]*dq[1][1][1][iv] - kappa1*dq[1][1][1][iv]*dq[0][1][1][iv]+ kappa1*dq[1][1][1][iv]*dq[1][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][1][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][1][iv]*dq[2][1][2][iv] - kappa1*dq[1][1][2][iv]*dq[0][1][2][iv]+ kappa1*dq[1][1][2][iv]*dq[1][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][1][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][2][iv]*dq[0][2][0][iv] - kappa1*dq[1][2][0][iv]*dq[0][2][0][iv]+ kappa1*dq[1][2][0][iv]*dq[2][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][2][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][2][iv]*dq[1][2][1][iv] - kappa1*dq[1][2][1][iv]*dq[0][2][1][iv]+ kappa1*dq[1][2][1][iv]*dq[2][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][2][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][0][2][iv]*dq[2][2][2][iv] - kappa1*dq[1][2][2][iv]*dq[0][2][2][iv]+ kappa1*dq[1][2][2][iv]*dq[2][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][2][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][0][iv]*h[0][0][iv] - h[1][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][1][iv]*h[0][1][iv] - h[1][1][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][2][iv]*h[0][2][iv] - h[1][2][iv]*q[0][2][iv];
+//
+//
+//  /* YX -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Y][X][iv] = -sthtmp[iv];
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[1][1][iv]+ r3)*qh[iv] -p0[iv] ;
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][0][iv]*(q[1][0][iv])   -xi*(q[1][0][iv]    )*h[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][1][iv]*(q[1][1][iv] + r3)   -xi*(q[1][1][iv]    +r3)*h[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][2][iv]*(q[1][2][iv])   -xi*(q[1][2][iv]    )*h[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][0][iv]*dq[0][0][0][iv] - kappa1*dq[1][0][0][iv]*dq[1][0][0][iv]+ kappa1*dq[1][0][0][iv]*dq[0][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][0][0][iv]*q[0][2][iv];
+//  
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][0][iv]*dq[1][0][1][iv] - kappa1*dq[1][0][1][iv]*dq[1][0][1][iv]+ kappa1*dq[1][0][1][iv]*dq[0][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][0][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][0][iv]*dq[2][0][2][iv] - kappa1*dq[1][0][2][iv]*dq[1][0][2][iv]+ kappa1*dq[1][0][2][iv]*dq[0][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][0][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][1][iv]*dq[0][1][0][iv] - kappa1*dq[1][1][0][iv]*dq[1][1][0][iv]+ kappa1*dq[1][1][0][iv]*dq[1][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][1][iv]*dq[1][1][1][iv] - kappa1*dq[1][1][1][iv]*dq[1][1][1][iv]+ kappa1*dq[1][1][1][iv]*dq[1][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][1][iv]*dq[2][1][2][iv] - kappa1*dq[1][1][2][iv]*dq[1][1][2][iv]+ kappa1*dq[1][1][2][iv]*dq[1][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][2][iv]*dq[0][2][0][iv] - kappa1*dq[1][2][0][iv]*dq[1][2][0][iv]+ kappa1*dq[1][2][0][iv]*dq[2][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][2][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][2][iv]*dq[1][2][1][iv] - kappa1*dq[1][2][1][iv]*dq[1][2][1][iv]+ kappa1*dq[1][2][1][iv]*dq[2][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][2][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][1][2][iv]*dq[2][2][2][iv] - kappa1*dq[1][2][2][iv]*dq[1][2][2][iv]+ kappa1*dq[1][2][2][iv]*dq[2][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][2][2][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][0][iv]*h[1][0][iv] - h[1][0][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][1][iv]*h[1][1][iv] - h[1][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][2][iv]*h[1][2][iv] - h[1][2][iv]*q[1][2][iv];
+//
+//
+//  /* YY -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Y][Y][iv] = -sthtmp[iv];
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[1][2][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][0][iv]*(q[2][0][iv])   -xi*(q[1][0][iv]    )*h[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][1][iv]*(q[2][1][iv])   -xi*(q[1][1][iv]    +r3)*h[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[1][2][iv]*(q[2][2][iv] + r3)   -xi*(q[1][2][iv]    )*h[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][0][iv]*dq[0][0][0][iv] - kappa1*dq[1][0][0][iv]*dq[2][0][0][iv]+ kappa1*dq[1][0][0][iv]*dq[0][2][0][iv];
+//  
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][0][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][0][iv]*dq[1][0][1][iv] - kappa1*dq[1][0][1][iv]*dq[2][0][1][iv]+ kappa1*dq[1][0][1][iv]*dq[0][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][0][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][0][iv]*dq[2][0][2][iv] - kappa1*dq[1][0][2][iv]*dq[2][0][2][iv]+ kappa1*dq[1][0][2][iv]*dq[0][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[1][0][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][1][iv]*dq[0][1][0][iv] - kappa1*dq[1][1][0][iv]*dq[2][1][0][iv]+ kappa1*dq[1][1][0][iv]*dq[1][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][1][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][1][iv]*dq[1][1][1][iv] - kappa1*dq[1][1][1][iv]*dq[2][1][1][iv]+ kappa1*dq[1][1][1][iv]*dq[1][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][1][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][1][iv]*dq[2][1][2][iv] - kappa1*dq[1][1][2][iv]*dq[2][1][2][iv]+ kappa1*dq[1][1][2][iv]*dq[1][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[1][1][2][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][2][iv]*dq[0][2][0][iv] - kappa1*dq[1][2][0][iv]*dq[2][2][0][iv]+ kappa1*dq[1][2][0][iv]*dq[2][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][2][iv]*dq[1][2][1][iv] - kappa1*dq[1][2][1][iv]*dq[2][2][1][iv]+ kappa1*dq[1][2][1][iv]*dq[2][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[1][2][2][iv]*dq[2][2][2][iv] - kappa1*dq[1][2][2][iv]*dq[2][2][2][iv]+ kappa1*dq[1][2][2][iv]*dq[2][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][0][iv]*h[2][0][iv] - h[1][0][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][1][iv]*h[2][1][iv] - h[1][1][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[1][2][iv]*h[2][2][iv] - h[1][2][iv]*q[2][2][iv];
+//
+//
+//  /* YZ -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Y][Z][iv] = -sthtmp[iv];
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[2][0][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][0][iv]*(q[0][0][iv] + r3)   -xi*(q[2][0][iv]    )*h[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][1][iv]*(q[0][1][iv])   -xi*(q[2][1][iv]    )*h[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][2][iv]*(q[0][2][iv])   -xi*(q[2][2][iv]    +r3)*h[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][0][iv]*dq[0][0][0][iv] - kappa1*dq[2][0][0][iv]*dq[0][0][0][iv]+ kappa1*dq[2][0][0][iv]*dq[0][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][0][iv]*dq[1][0][1][iv] - kappa1*dq[2][0][1][iv]*dq[0][0][1][iv]+ kappa1*dq[2][0][1][iv]*dq[0][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][0][iv]*dq[2][0][2][iv] - kappa1*dq[2][0][2][iv]*dq[0][0][2][iv]+ kappa1*dq[2][0][2][iv]*dq[0][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][1][iv]*dq[0][1][0][iv] - kappa1*dq[2][1][0][iv]*dq[0][1][0][iv]+ kappa1*dq[2][1][0][iv]*dq[1][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][1][0][iv]*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][1][iv]*dq[1][1][1][iv] - kappa1*dq[2][1][1][iv]*dq[0][1][1][iv]+ kappa1*dq[2][1][1][iv]*dq[1][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][1][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][1][iv]*dq[2][1][2][iv] - kappa1*dq[2][1][2][iv]*dq[0][1][2][iv]+ kappa1*dq[2][1][2][iv]*dq[1][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][1][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][2][iv]*dq[0][2][0][iv] - kappa1*dq[2][2][0][iv]*dq[0][2][0][iv]+ kappa1*dq[2][2][0][iv]*dq[2][0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][2][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][2][iv]*dq[1][2][1][iv] - kappa1*dq[2][2][1][iv]*dq[0][2][1][iv]+ kappa1*dq[2][2][1][iv]*dq[2][0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][2][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][0][2][iv]*dq[2][2][2][iv] - kappa1*dq[2][2][2][iv]*dq[0][2][2][iv]+ kappa1*dq[2][2][2][iv]*dq[2][0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][2][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][0][iv]*h[0][0][iv] - h[2][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][1][iv]*h[0][1][iv] - h[2][1][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][2][iv]*h[0][2][iv] - h[2][2][iv]*q[0][2][iv];
+//
+//
+//  /* ZX -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Z][X][iv] = -sthtmp[iv];
+//
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[2][1][iv])*qh[iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][0][iv]*(q[1][0][iv])   -xi*(q[2][0][iv]    )*h[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][1][iv]*(q[1][1][iv] + r3)   -xi*(q[2][1][iv]    )*h[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][2][iv]*(q[1][2][iv])   -xi*(q[2][2][iv]    +r3)*h[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][0][iv]*dq[0][0][0][iv] - kappa1*dq[2][0][0][iv]*dq[1][0][0][iv]+ kappa1*dq[2][0][0][iv]*dq[0][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][0][0][iv]*q[0][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][0][iv]*dq[1][0][1][iv] - kappa1*dq[2][0][1][iv]*dq[1][0][1][iv]+ kappa1*dq[2][0][1][iv]*dq[0][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][0][1][iv]*q[1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][0][iv]*dq[2][0][2][iv] - kappa1*dq[2][0][2][iv]*dq[1][0][2][iv]+ kappa1*dq[2][0][2][iv]*dq[0][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][0][2][iv]*q[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][1][iv]*dq[0][1][0][iv] - kappa1*dq[2][1][0][iv]*dq[1][1][0][iv]+ kappa1*dq[2][1][0][iv]*dq[1][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][1][iv]*dq[1][1][1][iv] - kappa1*dq[2][1][1][iv]*dq[1][1][1][iv]+ kappa1*dq[2][1][1][iv]*dq[1][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][1][iv]*dq[2][1][2][iv] - kappa1*dq[2][1][2][iv]*dq[1][1][2][iv]+ kappa1*dq[2][1][2][iv]*dq[1][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][2][iv]*dq[0][2][0][iv] - kappa1*dq[2][2][0][iv]*dq[1][2][0][iv]+ kappa1*dq[2][2][0][iv]*dq[2][1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][2][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][2][iv]*dq[1][2][1][iv] - kappa1*dq[2][2][1][iv]*dq[1][2][1][iv]+ kappa1*dq[2][2][1][iv]*dq[2][1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][2][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][1][2][iv]*dq[2][2][2][iv] - kappa1*dq[2][2][2][iv]*dq[1][2][2][iv]+ kappa1*dq[2][2][2][iv]*dq[2][1][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][2][2][iv]*q[2][0][iv];
+//  
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][0][iv]*h[1][0][iv] - h[2][0][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][1][iv]*h[1][1][iv] - h[2][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][2][iv]*h[1][2][iv] - h[2][2][iv]*q[1][2][iv];
+//
+//
+//  /* ZY -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Z][Y][iv] = -sthtmp[iv];
+//
+//
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] = 2.0*xi*(q[2][2][iv]+ r3)*qh[iv] -p0[iv] ;
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][0][iv]*(q[2][0][iv])   -xi*(q[2][0][iv]    )*h[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][1][iv]*(q[2][1][iv])   -xi*(q[2][1][iv]    )*h[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += -xi*h[2][2][iv]*(q[2][2][iv] + r3)   -xi*(q[2][2][iv]    +r3)*h[2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][0][iv]*dq[0][0][0][iv] - kappa1*dq[2][0][0][iv]*dq[2][0][0][iv]+ kappa1*dq[2][0][0][iv]*dq[0][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][0][0][iv]*q[0][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][0][iv]*dq[1][0][1][iv] - kappa1*dq[2][0][1][iv]*dq[2][0][1][iv]+ kappa1*dq[2][0][1][iv]*dq[0][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][0][1][iv]*q[1][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][0][iv]*dq[2][0][2][iv] - kappa1*dq[2][0][2][iv]*dq[2][0][2][iv]+ kappa1*dq[2][0][2][iv]*dq[0][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] -= 2.0*kappa1*q0*dq[2][0][2][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][1][iv]*dq[0][1][0][iv] - kappa1*dq[2][1][0][iv]*dq[2][1][0][iv]+ kappa1*dq[2][1][0][iv]*dq[1][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][1][0][iv]*q[0][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][1][iv]*dq[1][1][1][iv] - kappa1*dq[2][1][1][iv]*dq[2][1][1][iv]+ kappa1*dq[2][1][1][iv]*dq[1][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][1][1][iv]*q[1][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][1][iv]*dq[2][1][2][iv] - kappa1*dq[2][1][2][iv]*dq[2][1][2][iv]+ kappa1*dq[2][1][2][iv]*dq[1][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += 2.0*kappa1*q0*dq[2][1][2][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][2][iv]*dq[0][2][0][iv] - kappa1*dq[2][2][0][iv]*dq[2][2][0][iv]+ kappa1*dq[2][2][0][iv]*dq[2][2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][2][iv]*dq[1][2][1][iv] - kappa1*dq[2][2][1][iv]*dq[2][2][1][iv]+ kappa1*dq[2][2][1][iv]*dq[2][2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += - kappa0*dq[2][2][2][iv]*dq[2][2][2][iv] - kappa1*dq[2][2][2][iv]*dq[2][2][2][iv]+ kappa1*dq[2][2][2][iv]*dq[2][2][2][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][0][iv]*h[2][0][iv] - h[2][0][iv]*q[2][0][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][1][iv]*h[2][1][iv] - h[2][1][iv]*q[2][1][iv];
+//
+//  for_simd_v(iv, NSIMDVL) sthtmp[iv] += q[2][2][iv]*h[2][2][iv] - h[2][2][iv]*q[2][2][iv];
+//
+//
+//  /* ZZ -ve sign */
+//  for_simd_v(iv, NSIMDVL) s[Z][Z][iv] = -sthtmp[iv];
+printf("Not expected to reach here in vectorization\n");
+
+  return;
+}
+
