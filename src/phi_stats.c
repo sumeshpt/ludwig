@@ -94,6 +94,7 @@ int stats_field_info(field_t * field, map_t * map) {
   const char * q1[5] = {"phi", "phi", "phi", "phi", "phi"}; /* default */
   const char * q3[3] = {"Px ", "Py ", "Pz "};
   const char * q5[5] = {"Qxx", "Qxy", "Qxz", "Qyy", "Qyz"};
+  const char * q6[6] = {"Rxx", "Rxy", "Rxz", "Ryy", "Ryz", "Rzz"};
   const char ** q    = NULL;
 
   assert(field);
@@ -105,6 +106,9 @@ int stats_field_info(field_t * field, map_t * map) {
     break;
   case 5:
     q = q5;
+    break;
+  case 6:
+    q = q6;
     break;
   default:
     q = q1;
@@ -137,7 +141,7 @@ int stats_field_info(field_t * field, map_t * map) {
  *
  *  This is a global reduction to rank in communicator comm.
  *
- *  We expect and assert NQAB to be the largest number of field elements
+ *  We expect and assert NRAB to be the largest number of field elements
  *  to avoid memory allocation and deallocation here.
  *
  *****************************************************************************/
@@ -235,7 +239,7 @@ __global__ void stats_field_q_kernel(kernel_ctxt_t * ktx, field_t * field,
     map_status(map, index, &status);
 
     if (status == MAP_FLUID) {
-      double q0[NQAB] = {0};
+      double q0[NRAB] = {0};
 
       field_scalar_array(field, index, q0);
 
